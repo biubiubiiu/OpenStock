@@ -18,10 +18,11 @@ describe("getProviderConfig", () => {
 
   it("defaults to gemini when no env var is set", () => {
     delete process.env.AI_PROVIDER;
+    delete process.env.GEMINI_MODEL;
     const config = getProviderConfig();
     expect(config.name).toBe("gemini");
     expect(config.baseUrl).toContain("generativelanguage.googleapis.com");
-    expect(config.model).toBe("gemini-2.5-flash-lite");
+    expect(config.model).toBe("gemini-3.5-flash-lite");
   });
 
   it("returns minimax config when provider is minimax", () => {

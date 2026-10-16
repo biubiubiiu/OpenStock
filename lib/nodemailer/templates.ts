@@ -259,8 +259,17 @@ export const NEWS_SUMMARY_EMAIL_TEMPLATE = `<!DOCTYPE html>
 
                     <!-- Header with Logo -->
                     <tr>
-                        <td align="left" class="mobile-header-padding" style="padding: 40px 40px 20px 40px;">
-                            <img src="https://i.ibb.co/r28VWPjS/Screenshot-2025-10-04-123317-Picsart-Ai-Image-Enhancer-removebg-preview.png" alt="Openstock Logo" width="150" style="max-width: 100%; height: auto;">
+                        <td align="left" class="mobile-header-padding" style="padding: 30px 40px 15px 40px;">
+                            <table role="presentation" border="0" cellpadding="0" cellspacing="0">
+                                <tr>
+                                    <td style="vertical-align: middle; padding-right: 10px;">
+                                        <img src="https://raw.githubusercontent.com/ravixalgorithm/OpenStock/main/public/assets/images/logo.png" alt="OpenStock" width="36" height="36" style="display: block; border-radius: 6px;">
+                                    </td>
+                                    <td style="vertical-align: middle;">
+                                        <span style="font-size: 22px; font-weight: 700; color: #ffffff; letter-spacing: -0.5px;">OpenStock</span>
+                                    </td>
+                                </tr>
+                            </table>
                         </td>
                     </tr>
 

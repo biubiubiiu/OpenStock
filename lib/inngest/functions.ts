@@ -2,8 +2,6 @@ import { inngest } from "@/lib/inngest/client";
 import { NEWS_SUMMARY_EMAIL_PROMPT, PERSONALIZED_WELCOME_EMAIL_PROMPT } from "@/lib/inngest/prompts";
 import { sendNewsSummaryEmail, sendStockAlertEmail, sendWelcomeEmail } from "@/lib/nodemailer";
 import { getAllUsersForNewsEmail, getWatchlistSymbolsByEmail } from "@/lib/actions/user.actions";
-import { getNews } from "@/lib/actions/finnhub.actions";
-import { getFormattedTodayDate } from "@/lib/utils";
 import { callAIProviderWithFallback } from "@/lib/ai-provider";
 
 export const sendSignUpEmail = inngest.createFunction(
@@ -498,5 +496,344 @@ export const checkInactiveUsers = inngest.createFunction(
         });
 
         return { processed: inactiveUsers.length, sent: results };
+    }
+);
+
+interface PremarketNewsItem {
+    id: string;
+    symbol: string;
+    headline: string;
+    summary: string;
+}
+
+interface PremarketNewsAnalysis {
+    id: string;
+    titleZh: string;
+    event: string;
+    impact: string;
+}
+
+interface RawNewsArticle {
+    headline?: string;
+    summary?: string;
+    url?: string;
+    source?: string;
+}
+
+/**
+ * Premarket Watchlist & Sentiment Brief (Sent daily at 20:30 Beijing Time on trading days)
+ * Trigger:
+ *   1. Event: 'app/send.premarket.brief' (manual trigger / testing)
+ *   2. Cron: 'TZ=Asia/Shanghai 30 20 * * 1-5' (Mon-Fri 20:30 Beijing Time)
+ */
+export const sendPremarketBrief = inngest.createFunction(
+    {
+        id: 'premarket-watch-brief',
+        concurrency: 1,
+        retries: 0,
+        triggers: [
+            { event: 'app/send.premarket.brief' },
+            { cron: 'TZ=Asia/Shanghai 30 20 * * 1-5' },
+        ],
+    },
+    async ({ event, step }) => {
+        const isManual = event.name === 'app/send.premarket.brief';
+        const eventData = event.data as Record<string, unknown> | undefined;
+        const forceSend = Boolean(eventData?.force);
+
+        // Step 0: Market Timing Guard
+        // Checks whether today is a trading day and prevents sending outdated "premarket" emails
+        // if the system was asleep or delayed past US market open (09:30 AM ET).
+        const timingGuard = await step.run('market-timing-guard', async () => {
+            const { newYorkNow, isWeekday, OPEN } = await import('@/lib/market-session');
+            const ny = newYorkNow(new Date());
+            const todayMarketDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
+
+            if (!isWeekday(ny.weekday) && !isManual && !forceSend) {
+                return { canProceed: false, reason: `Weekend in New York (weekday ${ny.weekday})`, todayMarketDate, nyTime: ny.time };
+            }
+
+            // Market opens at 09:30 AM ET. If time is >= 09:30 AM ET, trading is already active.
+            // Sending "盘前 30 分钟" brief after open confuses traders and is stale.
+            if (ny.minutes >= OPEN && !isManual && !forceSend) {
+                return {
+                    canProceed: false,
+                    reason: `Current New York time is ${ny.time} (>= 09:30 AM open). Market is already open.`,
+                    todayMarketDate,
+                    nyTime: ny.time,
+                };
+            }
+
+            return { canProceed: true, reason: '', todayMarketDate, nyTime: ny.time };
+        });
+
+        if (!timingGuard.canProceed) {
+            console.log(`[Premarket Brief] ${timingGuard.reason}`);
+            return { success: false, reason: timingGuard.reason };
+        }
+
+        const todayMarketDate = timingGuard.todayMarketDate || new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
+
+        // Step 1: Get eligible users
+        const users = await step.run('fetch-eligible-users', async () => {
+            return await getAllUsersForNewsEmail();
+        });
+
+        if (!users || users.length === 0) {
+            return { message: 'No registered users found for premarket brief.' };
+        }
+
+        const { getStockSentimentInsights } = await import('@/lib/actions/adanos.actions');
+        const results = [];
+
+        for (const user of users) {
+            const userResult = await step.run(`process-user-${user.email}`, async () => {
+                // Idempotency: Deduplicate so each user receives AT MOST ONE brief per market date
+                const { connectToDatabase } = await import('@/database/mongoose');
+                const mongoose = await connectToDatabase();
+                const db = mongoose.connection.db;
+
+                if (db && !forceSend) {
+                    const userDoc = await db.collection('user').findOne<{ lastPremarketBriefDate?: string }>({ email: user.email });
+                    if (userDoc?.lastPremarketBriefDate === todayMarketDate) {
+                        console.log(`[Premarket Brief] Skipping ${user.email}: already sent today (${todayMarketDate})`);
+                        return { email: user.email, status: 'already_sent' };
+                    }
+                }
+
+                // Fetch user watchlist
+                let symbols = await getWatchlistSymbolsByEmail(user.email);
+                if (!symbols || symbols.length === 0) {
+                    symbols = ['NVDA', 'AAPL', 'TSLA']; // Default market leaders if empty watchlist
+                }
+
+                // Fetch sentiment insights & news in parallel
+                const finnhubKey = process.env.NEXT_PUBLIC_FINNHUB_API_KEY || process.env.FINNHUB_API_KEY || '';
+                const today = new Date();
+                const past = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+                const from = past.toISOString().split('T')[0];
+                const to = today.toISOString().split('T')[0];
+
+                const [sentimentList, companyNewsMap] = await Promise.all([
+                    Promise.all(symbols.map((s) => getStockSentimentInsights(s).catch(() => null))),
+                    (async () => {
+                        const map: Record<string, RawNewsArticle[]> = {};
+                        await Promise.all(
+                            symbols.map(async (s) => {
+                                try {
+                                    const res = await fetch(
+                                        `https://finnhub.io/api/v1/company-news?symbol=${s}&from=${from}&to=${to}&token=${finnhubKey}`,
+                                        { signal: AbortSignal.timeout(5000) }
+                                    );
+                                    const list = (await res.json()) as RawNewsArticle[];
+                                    map[s] = Array.isArray(list) ? list.slice(0, 2) : [];
+                                } catch {
+                                    map[s] = [];
+                                }
+                            })
+                        );
+                        return map;
+                    })(),
+                ]);
+
+                // Collect news items for AI summarization
+                const allNewsToSummarize: PremarketNewsItem[] = [];
+                for (const sym of symbols) {
+                    const list = companyNewsMap[sym] || [];
+                    list.forEach((item, idx) => {
+                        allNewsToSummarize.push({
+                            id: `${sym}-${idx}`,
+                            symbol: sym,
+                            headline: item.headline || '',
+                            summary: item.summary ? item.summary.slice(0, 250) : item.headline || '',
+                        });
+                    });
+                }
+
+                // Chunk into small batches (max 5 items) for fast parallel processing & preventing 503 high demand
+                const chunkSize = 5;
+                const chunks: PremarketNewsItem[][] = [];
+                for (let i = 0; i < allNewsToSummarize.length; i += chunkSize) {
+                    chunks.push(allNewsToSummarize.slice(i, i + chunkSize));
+                }
+
+                const summaryMap: Record<string, PremarketNewsAnalysis> = {};
+                const apiKey = process.env.GEMINI_API_KEY;
+                const candidateModels = Array.from(
+                    new Set(
+                        [
+                            process.env.GEMINI_MODEL,
+                            'gemini-3.5-flash-lite',
+                            'gemini-3.1-flash-lite',
+                            'gemini-2.5-flash-lite',
+                        ].filter(Boolean) as string[]
+                    )
+                );
+
+                const summarizeChunk = async (items: PremarketNewsItem[]): Promise<PremarketNewsAnalysis[]> => {
+                    const prompt = `你是资深美股量化与基本面分析师。请为投资者的盘前决策内参对以下美股最新要闻进行高质量中文精炼解读。
+
+新闻列表：
+${JSON.stringify(items, null, 2)}
+
+请严格返回一个 JSON 数组，数组中每个对象必须包含：
+- "id": 对应新闻的 id
+- "titleZh": 简短中文核心标题（12-20字，概括要闻精髓）
+- "event": 【核心事实】精炼阐述公司发生的具体业务/财务/合作事实（30-60字，通俗专业中文，严禁空话）
+- "impact": 【开盘影响】明确标明【利好/利空/偏中性】，并具体分析对今日开盘及短期股价走势的逻辑（30-60字）
+
+返回格式严格为标准 JSON 数组，严禁 markdown 代码块：
+[
+  {
+    "id": "...",
+    "titleZh": "...",
+    "event": "...",
+    "impact": "【利好/利空/偏中性】..."
+  }
+]`;
+
+                    for (const model of candidateModels) {
+                        try {
+                            const res = await fetch(
+                                `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+                                {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        contents: [{ parts: [{ text: prompt }] }],
+                                        generationConfig: { responseMimeType: 'application/json' },
+                                    }),
+                                    signal: AbortSignal.timeout(12000),
+                                }
+                            );
+
+                            if (res.ok) {
+                                const data = await res.json();
+                                const text = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+                                const cleaned = text.replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
+                                const parsed = JSON.parse(cleaned);
+                                if (Array.isArray(parsed)) {
+                                    return parsed as PremarketNewsAnalysis[];
+                                }
+                            }
+                        } catch {
+                            // Continue to next model on error or timeout
+                        }
+                    }
+                    return [];
+                };
+
+                if (apiKey && chunks.length > 0) {
+                    const chunkResults = await Promise.all(chunks.map(summarizeChunk));
+                    for (const entry of chunkResults.flat()) {
+                        if (entry.id && entry.event) {
+                            summaryMap[entry.id] = entry;
+                        }
+                    }
+                }
+
+                // Build stock cards
+                const summarizedCards = symbols.map((sym, idx) => {
+                    const insight = sentimentList[idx];
+                    const buzz = insight?.averageBuzz ?? 60;
+                    const bullish = insight?.bullishAverage ?? 68;
+                    const trendSource = insight?.sources?.find((s) => s.trend)?.trend;
+                    const trend = trendSource === 'rising' ? '上升' : trendSource === 'falling' ? '下降' : '平稳';
+                    const newsList = companyNewsMap[sym] || [];
+
+                    const processedNews = newsList.slice(0, 2).map((item, newsIdx) => {
+                        const newsId = `${sym}-${newsIdx}`;
+                        const aiAnalysis = summaryMap[newsId];
+
+                        return {
+                            headline: item.headline || sym,
+                            url: item.url || '#',
+                            source: item.source || '财经快讯',
+                            titleZh: aiAnalysis?.titleZh || item.headline || '公司盘前重要资讯',
+                            event: aiAnalysis?.event || `公司近期发布相关资讯，内容涉及：${item.summary ? item.summary.slice(0, 80) : item.headline}`,
+                            impact: aiAnalysis?.impact || '【中性观察】短期关注开盘成交量与板块整体多空情绪。',
+                        };
+                    });
+
+                    const newsSectionHtml = processedNews.length > 0
+                        ? `<div style="margin-top: 14px; border-top: 1px dashed #334155; padding-top: 12px;">
+                             <p style="margin: 0 0 10px 0; font-size: 13px; font-weight: 700; color: #FDD458;">
+                               📰 重大公司动态与盘前要闻（中文提炼）：
+                             </p>
+                             <div style="display: flex; flex-direction: column; gap: 12px;">
+                               ${processedNews.map((item) => `
+                                 <div style="background-color: #0f172a; border-left: 3px solid #38bdf8; padding: 10px 14px; border-radius: 4px; margin-bottom: 8px;">
+                                   <div style="margin-bottom: 6px;">
+                                     <span style="font-size: 13px; font-weight: 700; color: #60a5fa;">📌 ${item.titleZh}</span>
+                                   </div>
+                                   <p style="margin: 0 0 5px 0; font-size: 12.5px; color: #e2e8f0; line-height: 1.5;">
+                                     📝 <strong>【核心事实】</strong>：${item.event}
+                                   </p>
+                                   <p style="margin: 0; font-size: 12.5px; color: #fde047; line-height: 1.5;">
+                                     💡 <strong>【开盘影响研判】</strong>：${item.impact}
+                                   </p>
+                                   <div style="font-size: 11px; color: #64748b; margin-top: 6px; padding-top: 4px; border-top: 1px dotted #1e293b;">
+                                     原文: <a href="${item.url}" target="_blank" rel="noopener noreferrer" style="color: #64748b; text-decoration: underline;">${item.headline}</a> (来源: ${item.source})
+                                   </div>
+                                 </div>
+                               `).join('')}
+                             </div>
+                           </div>`
+                        : `<div style="margin-top: 10px; background-color: #0f172a; padding: 10px 14px; border-radius: 4px; font-size: 12px; color: #94a3b8;">
+                             📊 今日盘前暂无重大突发异动公告，建议密切关注大盘走势与开盘量能变化。
+                           </div>`;
+
+                    return `
+                    <div style="background-color: #1e293b; padding: 20px; margin: 16px 0; border-radius: 8px; border-left: 4px solid #20c997;">
+                      <div style="display: flex; justify-content: space-between; align-items: baseline;">
+                        <h3 style="margin: 0; font-size: 20px; color: #ffffff;">
+                          <span style="color: #FDD458; font-weight: bold;">${sym}</span>
+                        </h3>
+                        <span style="font-size: 12px; color: #94a3b8;">情绪走向: ${trend}</span>
+                      </div>
+                      <p style="margin: 8px 0 0 0; font-size: 13px; color: #cbd5e1;">
+                        🔥 社交热度 (Reddit/X): <strong style="color: #ffffff;">${buzz}/100</strong> &nbsp;|&nbsp; 
+                        🎯 市场多空情绪: <strong style="color: ${bullish >= 50 ? '#20c997' : '#f87171'};">${bullish}% 看多</strong>
+                      </p>
+                      ${newsSectionHtml}
+                    </div>`;
+                });
+
+                const dateStr = new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', year: 'numeric' });
+                const fullHtml = `
+                <div style="background-color: #0f172a; border: 1px solid #334155; border-radius: 10px; padding: 24px; color: #ffffff;">
+                  <h2 style="margin: 0 0 6px 0; color: #20c997; font-size: 22px;">📊 OpenStock 盘前全量自选股决策内参</h2>
+                  <p style="margin: 0 0 20px 0; color: #94a3b8; font-size: 14px;">
+                    涵盖您关注的全部 <strong>${symbols.length}</strong> 只个股 · 重磅新闻经 Gemini 中文精炼速递 · ${dateStr}
+                  </p>
+                  ${summarizedCards.join('')}
+                  <div style="border-top: 1px solid #334155; margin-top: 24px; padding-top: 16px; text-align: center; color: #64748b; font-size: 12px;">
+                    OpenStock · 每日美股盘前决策内参自动化推送
+                  </div>
+                </div>`;
+
+                // Send email
+                const sendResult = await sendNewsSummaryEmail({
+                    email: user.email,
+                    date: `${dateStr} · 盘前决策内参`,
+                    newsContent: fullHtml,
+                });
+
+                // Update deduplication field in DB
+                if (db && sendResult.status === 'sent') {
+                    await db.collection('user').updateOne(
+                        { email: user.email },
+                        { $set: { lastPremarketBriefDate: todayMarketDate, lastPremarketBriefSentAt: new Date() } }
+                    );
+                    console.log(`[Premarket Brief] Marked today (${todayMarketDate}) as sent for ${user.email}`);
+                }
+
+                return { email: user.email, status: sendResult.status };
+            });
+
+            results.push(userResult);
+        }
+
+        return { success: true, count: results.length, details: results };
     }
 );

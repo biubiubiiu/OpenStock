@@ -17,18 +17,48 @@ if (!hasEmailConfig) {
     console.warn('⚠️ Email credentials are not configured. Welcome and news summary emails are disabled until NODEMAILER_EMAIL and NODEMAILER_PASSWORD are set.');
 }
 
+const emailUser = process.env.NODEMAILER_EMAIL || '';
+const isQQ = emailUser.includes('@qq.com') || emailUser.includes('@foxmail.com');
+
 export const transporter = hasEmailConfig
-    ? nodemailer.createTransport({
-        service: 'gmail',
-        auth: {
-            user: process.env.NODEMAILER_EMAIL!,
-            pass: process.env.NODEMAILER_PASSWORD!,
-        },
-        // Keep the pool small because email volume is low in this app.
-        pool: true,
-        maxConnections: 1,
-        maxMessages: 3,
-    })
+    ? nodemailer.createTransport(
+        process.env.NODEMAILER_HOST
+            ? {
+                host: process.env.NODEMAILER_HOST,
+                port: Number(process.env.NODEMAILER_PORT || 465),
+                secure: Number(process.env.NODEMAILER_PORT || 465) === 465,
+                auth: {
+                    user: process.env.NODEMAILER_EMAIL!,
+                    pass: process.env.NODEMAILER_PASSWORD!,
+                },
+                connectionTimeout: 10000,
+                greetingTimeout: 10000,
+                socketTimeout: 15000,
+            }
+            : isQQ
+            ? {
+                host: 'smtp.qq.com',
+                port: 465,
+                secure: true,
+                auth: {
+                    user: process.env.NODEMAILER_EMAIL!,
+                    pass: process.env.NODEMAILER_PASSWORD!,
+                },
+                connectionTimeout: 10000,
+                greetingTimeout: 10000,
+                socketTimeout: 15000,
+            }
+            : {
+                service: 'gmail',
+                auth: {
+                    user: process.env.NODEMAILER_EMAIL!,
+                    pass: process.env.NODEMAILER_PASSWORD!,
+                },
+                connectionTimeout: 10000,
+                greetingTimeout: 10000,
+                socketTimeout: 15000,
+            }
+    )
     : null;
 
 if (transporter) {

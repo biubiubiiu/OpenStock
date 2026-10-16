@@ -56,7 +56,7 @@ export function getProviderConfig(
         apiKey: process.env.GEMINI_API_KEY || "",
         baseUrl:
           "https://generativelanguage.googleapis.com/v1beta/models",
-        model: process.env.GEMINI_MODEL || "gemini-2.5-flash-lite",
+        model: process.env.GEMINI_MODEL || "gemini-3.5-flash-lite",
       };
   }
 }

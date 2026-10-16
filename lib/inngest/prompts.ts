@@ -228,3 +228,52 @@ EXAMPLES:
 - Barclays PLC (BARC.L) from Finnhub → {"tradingViewSymbol": "LSE:BARC", "confidence": "high", "reasoning": "Barclays trades on London Stock Exchange as BARC"}
 
 Your response must be valid JSON only. Do not include any other text.`
+
+export const PREMARKET_WATCH_BRIEF_PROMPT = `你是资深美股分析师。请为投资者的自选股盘前早报（开盘前30分钟发送）生成中文HTML内容。
+该内容将被插入邮件正文 {{newsContent}} 占位符处。
+
+用户的自选股数据、舆论情绪及重大公司新闻：
+{{marketData}}
+
+核心格式与中文输出规范：
+- 严格仅输出纯 HTML 代码，禁止任何 markdown 标记（严禁 \`\`\`html，严禁反引号）。
+- 语言：所有分析、总结和解读必须使用通俗清晰、专业的【中文】。
+- 遍历用户 Watchlist 中的每一个标的，针对每个股票生成独立卡片：
+  <div class="dark-info-box" style="background-color: #1e293b; padding: 22px; margin: 18px 0; border-radius: 8px; border-left: 4px solid #20c997;">
+    <div style="display: flex; justify-content: space-between; align-items: baseline;">
+      <h3 style="margin: 0; font-size: 20px; color: #FFFFFF;">
+        <strong style="color: #FDD458;">{SYMBOL}</strong> · {COMPANY_NAME}
+      </h3>
+      <span style="font-size: 12px; color: #94a3b8;">情绪走向: {TREND}</span>
+    </div>
+    <!-- 舆论热度与多空情绪 -->
+    <p style="margin: 8px 0 14px 0; font-size: 13px; color: #cbd5e1;">
+      🔥 社交热度: <strong style="color: #ffffff;">{BUZZ_SCORE}/100</strong> &nbsp;|&nbsp; 
+      🎯 多空倾向: <strong style="color: #20c997;">{BULLISH_PCT}% 看多</strong>
+    </p>
+
+    <!-- 重大公司动态与盘前要闻简明中文总结 -->
+    <div style="border-top: 1px dashed #374151; padding-top: 12px; margin-top: 10px;">
+      <p style="margin: 0 0 8px 0; font-size: 13px; font-weight: 700; color: #FDD458;">📰 重大公司动态与盘前要闻（中文速递）：</p>
+      <ul style="margin: 0; padding-left: 0; list-style: none;">
+        <!-- 针对每条新闻提炼1-2句精炼中文核心与影响判断 -->
+        <li style="margin-bottom: 12px; font-size: 14px; line-height: 1.5;">
+          • <a href="{NEWS_URL}" target="_blank" rel="noopener noreferrer" style="color: #60a5fa; text-decoration: none; font-weight: 600;">{中文提炼的新闻核心标题}</a>
+          <p style="margin: 4px 0 0 14px; font-size: 12px; color: #cbd5e1; line-height: 1.4;">
+            <strong>【影响解读】</strong> {简述对股价/业务的核心影响，如推出新AI功能、业绩指引调高、大行评级等}
+          </p>
+        </li>
+      </ul>
+    </div>
+
+    <!-- 盘前行动启发/底线结论 -->
+    <div style="background-color: #0f172a; border: 1px solid #334155; padding: 12px; border-radius: 6px; margin-top: 14px;">
+      <p style="margin: 0; font-size: 13px; color: #cbd5e1; line-height: 1.4;">
+        💡 <strong style="color: #FDD458;">盘前看点与预判：</strong> {一句话总结该股今日开盘主要关注点}
+      </p>
+    </div>
+  </div>
+
+- 邮件开头附带 1-2 句当前大盘整体盘前宏观情绪简述。
+- 全文样式使用行内样式（Inline styles），保证各类邮件客户端完美兼容。`;
+
